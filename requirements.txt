@@ -5,6 +5,7 @@ scipy
 folium
 streamlit-folium
 plotly
+statsmodels
 shapely
 pandas
 numpy

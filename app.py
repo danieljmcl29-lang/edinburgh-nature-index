@@ -94,3 +94,105 @@ if not default_types:
     default_types = all_types
 selected_types = st.sidebar.multiselect("Greenspace classifications", all_types, default=default_types)
 st.sidebar.caption("Not all mapped types permit unrestricted access. Site classifications are not ecological quality assessments.")
+
+results, selected_sites = score_zones(zones, sites, distances, threshold, min_area, weight, selected_types)
+covered = results[results.sites_reachable > 0]
+pop_total = results.Population.sum()
+pop_covered = covered.Population.sum()
+weighted_index = np.average(results.NEAI, weights=results.Population) if pop_total > 0 else results.NEAI.mean()
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Edinburgh data zones", f"{len(zones):,}")
+m2.metric("Included greenspaces", f"{len(selected_sites):,}")
+m3.metric("Zone populations with access", f"{100 * pop_covered / pop_total:.1f}%" if pop_total else "N/A")
+m4.metric("Population-weighted NEAI", f"{weighted_index:.3f}")
+st.caption("Population coverage is based on each data zone's representative point, not individual household locations.")
+
+map_tab, equity_tab, explorer_tab, methodology_tab = st.tabs([
+    "Accessibility map", "Environmental justice", "Scenario explorer", "Data and methodology"
+])
+
+with map_tab:
+    metric = st.radio("Map colour", ["NEAI", "SIMD_decile", "sites_reachable"], horizontal=True)
+    colour_names = {"NEAI": "NEAI score", "SIMD_decile": "SIMD decile (1 = most deprived)", "sites_reachable": "Reachable sites"}
+    fig = px.choropleth_mapbox(
+        results,
+        geojson=shapes,
+        locations="DataZone",
+        featureidkey="properties.DataZone",
+        color=metric,
+        color_continuous_scale="RdYlGn" if metric != "SIMD_decile" else "RdYlBu",
+        mapbox_style="carto-positron",
+        center={"lat": 55.95, "lon": -3.20},
+        zoom=10.1,
+        opacity=0.69,
+        hover_data={"SIMD_rank": True, "SIMD_decile": True, "NEAI": ":.3f", "sites_reachable": True},
+        labels={metric: colour_names[metric]},
+    )
+    fig.update_layout(height=610, margin=dict(l=0, r=0, b=0, t=0))
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("Coloured polygons are the actual 2011 data-zone boundaries, not synthetic point locations.")
+    st.subheader("Qualifying mapped greenspaces")
+    st.dataframe(selected_sites[["name", "type", "area_ha"]].sort_values("area_ha", ascending=False),
+                 use_container_width=True, hide_index=True)
+
+with equity_tab:
+    st.subheader("Relationship between deprivation and accessible nature")
+    a, b = st.columns(2)
+    with a:
+        scatter = px.scatter(results, x="SIMD_rank", y="NEAI", color="SIMD_decile", hover_name="DataZone",
+                             labels={"SIMD_rank": "SIMD rank (higher = less deprived)"})
+        st.plotly_chart(scatter, use_container_width=True)
+    with b:
+        box = px.box(results, x="SIMD_decile", y="NEAI", points=False,
+                     labels={"SIMD_decile": "SIMD deprivation decile"})
+        st.plotly_chart(box, use_container_width=True)
+    if results.NEAI.nunique() > 1 and results.SIMD_rank.nunique() > 1:
+        rho, p = spearmanr(results.SIMD_rank, results.NEAI)
+        st.metric("Spearman rank correlation", f"{rho:.3f}")
+        st.caption(f"Exploratory p-value: {p:.3g}. Correlation is not causation; spatial dependence affects inference.")
+    st.subheader("Most deprived areas with low modelled access")
+    priority = results[results.SIMD_decile <= 2].sort_values("NEAI")
+    st.dataframe(priority[["DataZone", "SIMD_decile", "Population", "sites_reachable", "NEAI"]].head(30),
+                 use_container_width=True, hide_index=True)
+
+with explorer_tab:
+    st.subheader("How assumptions change the index")
+    st.write("Use the left-hand controls to vary distance thresholds, minimum park size, classifications and index weighting.")
+    hist = px.histogram(results, x="NEAI", nbins=20, title="Distribution of accessibility scores")
+    st.plotly_chart(hist, use_container_width=True)
+    choice = st.selectbox("Inspect data zone", sorted(results.DataZone))
+    r = results[results.DataZone == choice].iloc[0]
+    x, y, z = st.columns(3)
+    x.metric("Index", f"{r.NEAI:.3f}")
+    y.metric("Sites in range", int(r.sites_reachable))
+    z.metric("Nearest site", f"{r.nearest_m:.0f} m" if pd.notna(r.nearest_m) else "None within threshold")
+
+with methodology_tab:
+    st.markdown("""
+**Data:** OS Open Greenspace sites and access points (2026 extract), SIMD 2020v2 ranks and populations,
+2011 Scottish data-zone boundaries. All data are real, but straight-line access is only a baseline.
+
+**Proximity:** `max(0, 1 − nearest qualifying site distance / threshold)`.
+
+**Provision:** `min(1, distinct qualifying reachable sites / 5)`.
+
+**Index:** `NEAI = weight × proximity + (1 − weight) × provision`.
+
+**Important limitations:** The 2011-zone centroid/representative point is not a population-weighted dwelling location.
+OS Open Greenspace categories do not verify public accessibility or ecological quality. Baseline distances
+measure straight-line proximity to mapped access points; they do **not** account for barriers, street layout
+or pedestrian restrictions. OS Open Roads alone is not a complete pedestrian network. SIMD 2020v2 is a
+historical, relative deprivation measure. This project does not establish causal relationships.
+
+**Next methodological stage:** Independently preprocess and validate a pedestrian-accessible road/path network,
+then add `data/network_distances.csv` containing one record per data-zone/site pair with the shortest
+verified network distance in metres (covering at least the full 2 km scenario threshold). An absent route
+must be distinguished from a route not computed. Until then the application remains a proximity baseline.
+""")
+    st.download_button("Download scenario results (CSV)", results.to_csv(index=False).encode("utf-8"),
+                       file_name="neai_edinburgh_results.csv", mime="text/csv")
+    st.caption("Contains Ordnance Survey data © Crown copyright and database right 2026. "
+               "Scottish Government data-zone and SIMD data under the Open Government Licence.")
+
+st.caption("NEAI · Research prototype · Independent analysis, with AI-assisted development")

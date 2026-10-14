@@ -1,15 +1,6 @@
 
-"""NEAI: Stage 1 — Edinburgh greenspace exploration.
-
-OpenStreetMap features, not an OS Open Greenspace or accessibility study.
-"""
-
 import streamlit as st
 import pandas as pd
-import requests
-import folium
-from streamlit_folium import st_folium
-import html
 
 st.set_page_config(
     page_title="Edinburgh Nature Equitable Access Index",
@@ -20,284 +11,182 @@ st.set_page_config(
 st.title("Edinburgh Nature Equitable Access Index")
 
 st.caption(
-    "Stage 1 · Explore Edinburgh greenspaces using OpenStreetMap"
+    "Exploring greenspace distribution and environmental "
+    "inequality across Edinburgh"
 )
 
 st.info(
-    "This map displays OpenStreetMap greenspace features. "
-    "Walking-network accessibility, park entrances, SIMD and "
-    "the final index will be added in subsequent stages."
+    "Stage 1: Interactive greenspace map. "
+    "Walking accessibility and SIMD deprivation "
+    "analysis will be added in subsequent stages."
 )
 
-# --------------------------------------------------
-# OPENSTREETMAP DATA
-# --------------------------------------------------
+# ------------------------------------------
+# EDINBURGH GREENSPACES
+# ------------------------------------------
+# Approximate representative coordinates.
+# These are NOT official park boundaries
+# or verified pedestrian entrances.
 
-OVERPASS_URLS = [
-    "https://overpass.kumi.systems/api/interpreter",
-    "https://overpass-api.de/api/interpreter"
-]
+@st.cache_data
+def load_greenspaces():
 
-# Central Edinburgh bounding box
-QUERY = """[out:json][timeout:25];
-(
- way["leisure"="park"](55.900,-3.300,56.000,-3.100);
- relation["leisure"="park"](55.900,-3.300,56.000,-3.100);
- way["leisure"="garden"](55.900,-3.300,56.000,-3.100);
- way["leisure"="nature_reserve"](55.900,-3.300,56.000,-3.100);
-);
-out center;"""
+    records = [
+        ("The Meadows", "Park", 55.9414, -3.1931),
+        ("Princes Street Gardens", "Park", 55.9507, -3.2040),
+        ("Holyrood Park", "Park", 55.9440, -3.1570),
+        ("Inverleith Park", "Park", 55.9676, -3.2136),
+        ("Saughton Park", "Park", 55.9344, -3.2485),
+        ("Leith Links", "Park", 55.9718, -3.1628),
+        ("Harrison Park", "Park", 55.9345, -3.2246),
+        ("Victoria Park", "Park", 55.9757, -3.1959),
+        ("Lochend Park", "Park", 55.9635, -3.1498),
+        ("Figgate Park", "Park", 55.9529, -3.1185),
+        ("Craigmillar Castle Park", "Park", 55.9222, -3.1476),
+        ("Corstorphine Hill", "Woodland", 55.9573, -3.2790),
+        ("Blackford Hill", "Woodland", 55.9234, -3.1946),
+        ("Braid Hills", "Open Space", 55.9125, -3.2030),
+        ("Calton Hill", "Park", 55.9550, -3.1827),
+        ("Royal Botanic Garden", "Garden", 55.9661, -3.2090),
+        ("Starbank Park", "Park", 55.9758, -3.2043),
+        ("Pilrig Park", "Park", 55.9673, -3.1811),
+        ("Duddingston Loch", "Blue Space", 55.9416, -3.1460),
+        ("Portobello Beach", "Blue Space", 55.9536, -3.1110)
+    ]
 
-
-@st.cache_data(
-    ttl=86400,
-    show_spinner="Loading mapped greenspaces from OpenStreetMap..."
-)
-def load_parks():
-    errors = []
-
-    for url in OVERPASS_URLS:
-        try:
-            response = requests.post(
-                url,
-                data={"data": QUERY},
-                timeout=45,
-                headers={
-                    "User-Agent": "NEAI-educational-demo/1.0"
-                }
-            )
-
-            response.raise_for_status()
-            elements = response.json().get("elements", [])
-
-            records = []
-
-            for element in elements:
-                center = element.get("center", {})
-                tags = element.get("tags", {})
-
-                lat = center.get("lat")
-                lon = center.get("lon")
-
-                if lat is None or lon is None:
-                    continue
-
-                if not (
-                    55.90 <= lat <= 56.0
-                    and -3.30 <= lon <= -3.10
-                ):
-                    continue
-
-                records.append({
-                    "osm_id": f"{element['type']}/{element['id']}",
-                    "name": tags.get(
-                        "name", "Unnamed greenspace"
-                    ),
-                    "type": tags.get("leisure", "Other"),
-                    "latitude": float(lat),
-                    "longitude": float(lon)
-                })
-
-            if records:
-                df = pd.DataFrame(records)
-                return (
-                    df.drop_duplicates(subset="osm_id"),
-                    None
-                )
-
-            errors.append("No records returned")
-
-        except (
-            requests.RequestException,
-            ValueError,
-            KeyError
-        ) as exc:
-            errors.append(str(exc))
-
-    empty = pd.DataFrame(columns=[
-        "osm_id",
-        "name",
-        "type",
-        "latitude",
-        "longitude"
-    ])
-
-    return empty, "; ".join(errors)
+    return pd.DataFrame(
+        records,
+        columns=["Name", "Type", "lat", "lon"]
+    )
 
 
-# --------------------------------------------------
+greenspaces = load_greenspaces()
+
+# ------------------------------------------
 # SIDEBAR
-# --------------------------------------------------
+# ------------------------------------------
 
-with st.sidebar:
+st.sidebar.header("Map controls")
 
-    st.header("Explore greenspaces")
-
-    st.write(
-        "Source: © OpenStreetMap contributors (ODbL)"
-    )
-
-    if st.button("Refresh source data"):
-        load_parks.clear()
-        st.rerun()
-
-
-# --------------------------------------------------
-# LOAD GREENSPACE RECORDS
-# --------------------------------------------------
-
-parks, error = load_parks()
-
-if parks.empty:
-
-    st.error(
-        "The live OpenStreetMap service is currently "
-        "unavailable or returned no data. "
-        "Please try Refresh source data later."
-    )
-
-    if error:
-        st.caption(
-            f"Data service details: {error[:400]}"
-        )
-
-    st.stop()
-
-
-# --------------------------------------------------
-# GREENSPACE FILTERS
-# --------------------------------------------------
-
-kinds = sorted(parks["type"].unique())
+categories = sorted(greenspaces["Type"].unique())
 
 selected = st.sidebar.multiselect(
-    "Greenspace categories",
-    kinds,
-    default=kinds
+    "Greenspace type",
+    categories,
+    default=categories
 )
 
-name_search = st.sidebar.text_input(
-    "Search by name",
+search = st.sidebar.text_input(
+    "Search greenspace",
     ""
 )
 
-filtered = parks[
-    parks["type"].isin(selected)
+filtered = greenspaces[
+    greenspaces["Type"].isin(selected)
 ].copy()
 
-if name_search.strip():
-
+if search.strip():
     filtered = filtered[
-        filtered["name"].str.contains(
-            name_search.strip(),
+        filtered["Name"].str.contains(
+            search.strip(),
             case=False,
             regex=False
         )
     ]
 
+# ------------------------------------------
+# STATISTICS
+# ------------------------------------------
 
-# --------------------------------------------------
-# SUMMARY STATISTICS
-# --------------------------------------------------
-
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 
 col1.metric(
-    "Mapped greenspace features",
-    f"{len(parks):,}"
+    "Reference locations",
+    len(greenspaces)
 )
 
 col2.metric(
-    "Matching your filters",
-    f"{len(filtered):,}"
+    "Visible locations",
+    len(filtered)
 )
 
-st.caption(
-    "Points are feature centres, not park entrances. "
-    "Counts refer to mapped OSM features and may "
-    "include overlapping features."
+col3.metric(
+    "Greenspace categories",
+    filtered["Type"].nunique()
 )
 
-
-# --------------------------------------------------
-# INTERACTIVE EDINBURGH MAP
-# --------------------------------------------------
+# ------------------------------------------
+# INTERACTIVE MAP
+# ------------------------------------------
 
 st.subheader("Edinburgh Greenspace Map")
 
-map_obj = folium.Map(
-    location=[55.9533, -3.1883],
-    zoom_start=12,
-    tiles="CartoDB positron",
-    control_scale=True
+if not filtered.empty:
+
+    st.map(
+        filtered,
+        latitude="lat",
+        longitude="lon",
+        size=90,
+        zoom=11
+    )
+
+else:
+    st.warning(
+        "No locations match your selected filters."
+    )
+
+st.caption(
+    "Locations are illustrative reference points "
+    "with approximate coordinates, not complete "
+    "greenspace polygons or official access points."
 )
 
-for p in filtered.itertuples(index=False):
-
-    label = html.escape(str(p.name))
-    kind = html.escape(str(p.type))
-
-    folium.CircleMarker(
-        location=[
-            p.latitude,
-            p.longitude
-        ],
-        radius=5,
-        color="#116c45",
-        fill=True,
-        fill_color="#2da66c",
-        fill_opacity=0.8,
-        popup=folium.Popup(
-            f"<strong>{label}</strong><br>{kind}",
-            max_width=250
-        ),
-        tooltip=label
-    ).add_to(map_obj)
-
-st_folium(
-    map_obj,
-    height=540,
-    use_container_width=True,
-    returned_objects=[]
-)
-
-
-# --------------------------------------------------
-# GREENSPACE DATA TABLE
-# --------------------------------------------------
+# ------------------------------------------
+# DATA TABLE
+# ------------------------------------------
 
 st.subheader("Greenspace Records")
 
 st.dataframe(
-    filtered[[
-        "name",
-        "type",
-        "latitude",
-        "longitude",
-        "osm_id"
-    ]],
+    filtered,
     use_container_width=True,
     hide_index=True
 )
 
-
-# --------------------------------------------------
-# DOWNLOAD DATA
-# --------------------------------------------------
+# ------------------------------------------
+# DOWNLOAD
+# ------------------------------------------
 
 st.download_button(
-    label="Download filtered records (CSV)",
-    data=filtered.to_csv(
-        index=False
-    ).encode("utf-8"),
-    file_name="edinburgh_osm_greenspaces.csv",
+    "Download greenspace records (CSV)",
+    data=filtered.to_csv(index=False),
+    file_name="edinburgh_greenspaces_demo.csv",
     mime="text/csv"
 )
 
+# ------------------------------------------
+# PROJECT INFORMATION
+# ------------------------------------------
+
+st.subheader("About this project")
+
+st.write(
+    "The Edinburgh Nature Equitable Access Index "
+    "(NEAI) aims to examine how access to urban "
+    "greenspace varies across Edinburgh and how "
+    "these differences relate to social deprivation."
+)
+
+st.write(
+    "Future development will integrate Ordnance "
+    "Survey greenspace data, walking networks and "
+    "the Scottish Index of Multiple Deprivation "
+    "(SIMD)."
+)
+
 st.caption(
-    "Data © OpenStreetMap contributors · "
-    "https://www.openstreetmap.org/copyright · "
-    "Uses Overpass API. "
-    "Not yet an OS Open Greenspace dataset or "
-    "a measure of equitable access."
+    "Demonstration dataset only. "
+    "Not suitable for quantitative accessibility "
+    "or deprivation conclusions."
 )

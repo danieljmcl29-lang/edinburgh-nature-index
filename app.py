@@ -137,7 +137,7 @@ subset = simd[simd["DataZone"].isin(areas)] if areas else simd
 
 # ---------------- MAP ----------------
 st.subheader("Map: Nature Equitable Access Index")
-m = folium.Map(location=[55.9533, -3.1883], zoom_start=12, tiles="cartodbpositron")
+m = folium.Map(location=[55.9533, -3.1883], zoom_start=12)
 subset_wgs = subset.to_crs(4326)
 for _, r in subset_wgs.iterrows():
     folium.CircleMarker(

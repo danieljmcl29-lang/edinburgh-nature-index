@@ -1,198 +1,752 @@
-"""Edinburgh Nature Equitable Access Index — genuine datasets, provisional straight-line baseline.
 
-Network routing is deliberately NOT claimed until a validated network distance file exists.
-"""
 from pathlib import Path
 import json
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from scipy.stats import spearmanr
 
-st.set_page_config(page_title="Edinburgh Nature Equitable Access Index", page_icon="🌳", layout="wide")
-DATA = Path(__file__).parent / "data"
 
-@st.cache_data
+# ============================================================
+# PAGE CONFIGURATION
+# ============================================================
 
+st.set_page_config(
+    page_title="Edinburgh Nature Equitable Access Index",
+    page_icon="🌳",
+    layout="wide"
+)
+
+DATA = Path(__file__).resolve().parent / "data"
+
+
+# ============================================================
+# LOAD REAL EDINBURGH DATA
+# ============================================================
+
+@st.cache_data(show_spinner="Loading Edinburgh data...")
 def load_data():
-    zones = pd.read_csv(DATA / "edinburgh_zones.csv", dtype={"DataZone": str})
-    sites = pd.read_csv(DATA / "edinburgh_greenspaces.csv", dtype={"site_id": str})
-    access = pd.read_csv(DATA / "edinburgh_access_points.csv", dtype={"site_id": str})
-    shapes = json.loads((DATA / "edinburgh_zones.geojson").read_text(encoding="utf-8"))
-    return zones, sites, access, shapes
 
-@st.cache_data
-
-def load_distances(filename):
-    return pd.read_csv(DATA / filename, dtype={"DataZone": str, "site_id": str})
-
-
-def score_zones(zones, sites, distances, threshold, min_area, weight, allowed_types):
-    selected = sites[(sites.area_ha >= min_area) & sites.type.isin(allowed_types)]
-    valid = distances[
-        (distances.distance_m <= threshold) & distances.site_id.isin(selected.site_id)
-    ]
-    # Keep the shortest distance per site per zone, even if an optional routing
-    # table contains multiple entrances for the same site.
-    valid = valid.groupby(["DataZone", "site_id"], as_index=False).distance_m.min()
-    agg = valid.groupby("DataZone").agg(
-        nearest_m=("distance_m", "min"), sites_reachable=("site_id", "nunique")
-    ).reset_index()
-    out = zones.merge(agg, on="DataZone", how="left", validate="one_to_one")
-    out["sites_reachable"] = out.sites_reachable.fillna(0).astype(int)
-    out["proximity"] = (1 - out.nearest_m / threshold).clip(0, 1).fillna(0)
-    out["provision"] = (out.sites_reachable / 5).clip(0, 1)
-    out["NEAI"] = weight * out.proximity + (1 - weight) * out.provision
-    return out, selected
-
-
-st.title("Edinburgh Nature Equitable Access Index")
-st.caption("OS Open Greenspace (2026) · SIMD 2020v2 · Scottish 2011 Data Zones")
-st.write("Where do deprivation and limited access to mapped greenspaces coincide in Edinburgh?")
-
-try:
-    zones, sites, access, shapes = load_data()
-except (FileNotFoundError, ValueError, OSError) as error:
-    st.error(f"Required data file missing or unreadable: {error}")
-    st.info("Upload the complete `data/` folder alongside `app.py` in GitHub.")
-    st.stop()
-
-# A road-network matrix is optional and will only be used when explicitly present.
-network_file = DATA / "network_distances.csv"
-network_available = network_file.exists()
-if network_available:
-    mode = st.sidebar.radio("Distance model", ["Straight-line baseline", "Network model"])
-else:
-    mode = "Straight-line baseline"
-    st.warning(
-        "**Straight-line accessibility baseline (not pedestrian routing).** "
-        "All mapped greenspaces and SIMD data are real, but route distances are "
-        "currently measured as straight lines to mapped access points. "
-        "OS Open Roads has not yet been processed. Do not describe these as walking distances."
+    zones = pd.read_csv(
+        DATA / "edinburgh_zones.csv",
+        dtype={"DataZone": str}
     )
 
-filename = "network_distances.csv" if mode == "Network model" else "straight_line_distances.csv"
+    sites = pd.read_csv(
+        DATA / "edinburgh_greenspaces.csv",
+        dtype={"site_id": str}
+    )
+
+    entrances = pd.read_csv(
+        DATA / "edinburgh_access_points.csv",
+        dtype={"site_id": str}
+    )
+
+    shapes = json.loads(
+        (DATA / "edinburgh_zones.geojson").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    return zones, sites, entrances, shapes
+
+
+# ============================================================
+# CALCULATE STRAIGHT-LINE ACCESSIBILITY
+# ============================================================
+
+@st.cache_data(
+    show_spinner="Calculating straight-line accessibility once..."
+)
+def distance_matrix(zones, sites, entrances):
+
+    """
+    Calculate the shortest great-circle distance
+    from each Edinburgh data-zone reference point
+    to each greenspace's mapped access points.
+
+    Distances are in metres.
+
+    This does NOT calculate pedestrian walking routes.
+
+    No external API or distance CSV is required.
+    """
+
+    points = entrances[
+        entrances.site_id.isin(sites.site_id)
+    ].copy()
+
+    if points.empty:
+        raise ValueError(
+            "No access points match the greenspace site IDs"
+        )
+
+    # Convert geographical coordinates to radians.
+
+    zone_lat = np.radians(
+        zones.latitude.to_numpy(dtype=float)
+    )[:, None]
+
+    zone_lon = np.radians(
+        zones.longitude.to_numpy(dtype=float)
+    )[:, None]
+
+    point_lat = np.radians(
+        points.latitude.to_numpy(dtype=float)
+    )[None, :]
+
+    point_lon = np.radians(
+        points.longitude.to_numpy(dtype=float)
+    )[None, :]
+
+    # Haversine formula for great-circle distances.
+
+    a = (
+        np.sin((point_lat - zone_lat) / 2) ** 2
+        + np.cos(zone_lat)
+        * np.cos(point_lat)
+        * np.sin((point_lon - zone_lon) / 2) ** 2
+    )
+
+    metres = (
+        2
+        * 6371000
+        * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+    ).astype("float32")
+
+    # Multiple access points belonging to the same
+    # greenspace must count as one greenspace site.
+
+    labels, unique_ids = pd.factorize(
+        points.site_id,
+        sort=True
+    )
+
+    matrix = np.full(
+        (len(zones), len(unique_ids)),
+        np.inf,
+        dtype="float32"
+    )
+
+    for j in range(len(unique_ids)):
+        matrix[:, j] = metres[
+            :, labels == j
+        ].min(axis=1)
+
+    return pd.DataFrame(
+        matrix,
+        index=zones.DataZone,
+        columns=unique_ids
+    )
+
+
+# ============================================================
+# CALCULATE THE NATURE EQUITABLE ACCESS INDEX
+# ============================================================
+
+def score_zones(
+    zones,
+    sites,
+    dist,
+    threshold,
+    min_area,
+    weight,
+    categories
+):
+
+    # Select greenspaces satisfying the scenario.
+
+    eligible = sites[
+        (sites.area_ha >= min_area)
+        & sites.type.isin(categories)
+    ]
+
+    ids = eligible.site_id[
+        eligible.site_id.isin(dist.columns)
+    ]
+
+    out = zones.copy()
+
+    if len(ids):
+
+        m = dist.loc[
+            out.DataZone,
+            ids
+        ].to_numpy()
+
+        reachable = m <= threshold
+
+        counts = reachable.sum(axis=1)
+
+        nearest = np.where(
+            reachable,
+            m,
+            np.inf
+        ).min(axis=1)
+
+    else:
+
+        counts = np.zeros(
+            len(out),
+            dtype=int
+        )
+
+        nearest = np.full(
+            len(out),
+            np.inf
+        )
+
+    out["sites_reachable"] = counts
+
+    out["nearest_m"] = np.where(
+        np.isfinite(nearest),
+        nearest,
+        np.nan
+    )
+
+    # Proximity score, ranging from 0 to 1.
+
+    out["proximity"] = np.where(
+        np.isfinite(nearest),
+        np.maximum(
+            0,
+            1 - nearest / threshold
+        ),
+        0
+    )
+
+    # Provision score.
+    # Five or more qualifying sites = maximum score.
+
+    out["provision"] = np.minimum(
+        1,
+        counts / 5
+    )
+
+    # Final scenario-based NEAI score.
+
+    out["NEAI"] = (
+        weight * out.proximity
+        + (1 - weight) * out.provision
+    )
+
+    return out, eligible
+
+
+# ============================================================
+# TITLE AND INTRODUCTION
+# ============================================================
+
+st.title("Edinburgh Nature Equitable Access Index")
+
+st.caption(
+    "OS Open Greenspace · SIMD 2020v2 · "
+    "2011 Scottish Data Zones"
+)
+
+st.write(
+    "Where do deprivation and limited proximity "
+    "to mapped greenspaces coincide in Edinburgh?"
+)
+
+st.warning(
+    "**Straight-line proximity baseline only.** "
+    "Distances are calculated to mapped greenspace "
+    "access points, not along walking routes. "
+    "Roads, barriers and public access restrictions "
+    "are not modelled. Do not interpret the scores "
+    "as walking accessibility."
+)
+
+
+# ============================================================
+# LOAD DATA AND CALCULATE DISTANCES
+# ============================================================
+
 try:
-    distances = load_distances(filename)
-except (FileNotFoundError, ValueError) as error:
-    st.error(f"Distance data unavailable: {error}")
+
+    zones, sites, entrances, shapes = load_data()
+
+    distances = distance_matrix(
+        zones,
+        sites,
+        entrances
+    )
+
+except Exception as exc:
+
+    st.error(
+        "Could not load or calculate the real "
+        f"Edinburgh data: {exc}"
+    )
+
+    st.info(
+        "Check that the four input files are inside "
+        "GitHub's `data/` folder. "
+        "The distance CSV is no longer required."
+    )
+
     st.stop()
-required = {"DataZone", "site_id", "distance_m"}
-if not required.issubset(distances.columns) or distances.distance_m.isna().any() or (distances.distance_m < 0).any():
-    st.error("Distance matrix must contain DataZone, site_id and valid nonnegative distance_m values.")
-    st.stop()
+
+
+# ============================================================
+# INTERACTIVE SCENARIO CONTROLS
+# ============================================================
 
 st.sidebar.header("Accessibility scenario")
-threshold = st.sidebar.slider("Maximum distance (metres)", 200, 2000, 800, 100)
-min_area = st.sidebar.slider("Minimum site area (hectares)", 0.0, 5.0, 0.2, 0.1)
-weight = st.sidebar.slider("Proximity weighting", 0.0, 1.0, 0.5, 0.05)
-all_types = sorted(sites.type.dropna().unique())
-# Default to public park/garden; other classes can be included by user.
-default_types = [t for t in all_types if "Public Park" in t]
-if not default_types:
-    default_types = all_types
-selected_types = st.sidebar.multiselect("Greenspace classifications", all_types, default=default_types)
-st.sidebar.caption("Not all mapped types permit unrestricted access. Site classifications are not ecological quality assessments.")
 
-results, selected_sites = score_zones(zones, sites, distances, threshold, min_area, weight, selected_types)
-covered = results[results.sites_reachable > 0]
-pop_total = results.Population.sum()
-pop_covered = covered.Population.sum()
-weighted_index = np.average(results.NEAI, weights=results.Population) if pop_total > 0 else results.NEAI.mean()
+threshold = st.sidebar.slider(
+    "Maximum straight-line distance (m)",
+    min_value=200,
+    max_value=2000,
+    value=800,
+    step=100
+)
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Edinburgh data zones", f"{len(zones):,}")
-m2.metric("Included greenspaces", f"{len(selected_sites):,}")
-m3.metric("Zone populations with access", f"{100 * pop_covered / pop_total:.1f}%" if pop_total else "N/A")
-m4.metric("Population-weighted NEAI", f"{weighted_index:.3f}")
-st.caption("Population coverage is based on each data zone's representative point, not individual household locations.")
+min_area = st.sidebar.slider(
+    "Minimum greenspace area (ha)",
+    min_value=0.0,
+    max_value=5.0,
+    value=0.2,
+    step=0.1
+)
 
-map_tab, equity_tab, explorer_tab, methodology_tab = st.tabs([
-    "Accessibility map", "Environmental justice", "Scenario explorer", "Data and methodology"
+weight = st.sidebar.slider(
+    "Proximity weighting",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.5,
+    step=0.05
+)
+
+categories = sorted(
+    sites.type.dropna().unique().tolist()
+)
+
+default_categories = [
+    x for x in categories
+    if "Public Park" in x
+] or categories
+
+selected_categories = st.sidebar.multiselect(
+    "Greenspace classifications",
+    categories,
+    default=default_categories
+)
+
+st.sidebar.caption(
+    "Some OS classifications represent "
+    "restricted-access facilities."
+)
+
+
+# ============================================================
+# CALCULATE CURRENT SCENARIO
+# ============================================================
+
+results, selected_sites = score_zones(
+    zones,
+    sites,
+    distances,
+    threshold,
+    min_area,
+    weight,
+    selected_categories
+)
+
+covered_pop = results.loc[
+    results.sites_reachable > 0,
+    "Population"
+].sum()
+
+pop = results.Population.sum()
+
+mean_score = (
+    np.average(
+        results.NEAI,
+        weights=results.Population
+    )
+    if pop > 0
+    else results.NEAI.mean()
+)
+
+
+# ============================================================
+# SUMMARY STATISTICS
+# ============================================================
+
+a, b, c, d = st.columns(4)
+
+a.metric(
+    "Edinburgh data zones",
+    f"{len(zones):,}"
+)
+
+b.metric(
+    "Eligible greenspaces",
+    f"{len(selected_sites):,}"
+)
+
+c.metric(
+    "Zone population near a site",
+    (
+        f"{100 * covered_pop / pop:.1f}%"
+        if pop > 0
+        else "N/A"
+    )
+)
+
+d.metric(
+    "Population-weighted baseline NEAI",
+    f"{mean_score:.3f}"
+)
+
+st.caption(
+    "Population percentage is an approximation "
+    "based on one representative point per data zone, "
+    "not individual homes."
+)
+
+
+# ============================================================
+# APPLICATION TABS
+# ============================================================
+
+map_tab, equity_tab, scenario_tab, methodology_tab = st.tabs([
+    "Edinburgh map",
+    "Deprivation comparison",
+    "Scenario explorer",
+    "Methods & downloads"
 ])
 
+
+# ============================================================
+# TAB 1 — EDINBURGH MAP
+# ============================================================
+
 with map_tab:
-    metric = st.radio("Map colour", ["NEAI", "SIMD_decile", "sites_reachable"], horizontal=True)
-    colour_names = {"NEAI": "NEAI score", "SIMD_decile": "SIMD decile (1 = most deprived)", "sites_reachable": "Reachable sites"}
+
+    colour = st.radio(
+        "Map data",
+        [
+            "NEAI",
+            "SIMD_decile",
+            "sites_reachable"
+        ],
+        horizontal=True
+    )
+
     fig = px.choropleth_mapbox(
         results,
         geojson=shapes,
         locations="DataZone",
         featureidkey="properties.DataZone",
-        color=metric,
-        color_continuous_scale="RdYlGn" if metric != "SIMD_decile" else "RdYlBu",
+        color=colour,
+        color_continuous_scale="RdYlGn",
         mapbox_style="carto-positron",
-        center={"lat": 55.95, "lon": -3.20},
+        center={
+            "lat": 55.95,
+            "lon": -3.20
+        },
         zoom=10.1,
-        opacity=0.69,
-        hover_data={"SIMD_rank": True, "SIMD_decile": True, "NEAI": ":.3f", "sites_reachable": True},
-        labels={metric: colour_names[metric]},
+        opacity=0.7,
+        hover_data=[
+            "SIMD_rank",
+            "SIMD_decile",
+            "NEAI",
+            "sites_reachable"
+        ]
     )
-    fig.update_layout(height=610, margin=dict(l=0, r=0, b=0, t=0))
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption("Coloured polygons are the actual 2011 data-zone boundaries, not synthetic point locations.")
-    st.subheader("Qualifying mapped greenspaces")
-    st.dataframe(selected_sites[["name", "type", "area_ha"]].sort_values("area_ha", ascending=False),
-                 use_container_width=True, hide_index=True)
+
+    fig.update_layout(
+        height=610,
+        margin=dict(
+            l=0,
+            r=0,
+            b=0,
+            t=0
+        )
+    )
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True
+    )
+
+    st.caption(
+        "Real data-zone polygons. The NEAI layer "
+        "uses straight-line proximity, "
+        "not pedestrian routing."
+    )
+
+    st.subheader("Mapped greenspace sites")
+
+    st.dataframe(
+        selected_sites[
+            ["name", "type", "area_ha"]
+        ].sort_values(
+            "area_ha",
+            ascending=False
+        ),
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+# ============================================================
+# TAB 2 — ENVIRONMENTAL DEPRIVATION
+# ============================================================
 
 with equity_tab:
-    st.subheader("Relationship between deprivation and accessible nature")
-    a, b = st.columns(2)
-    with a:
-        scatter = px.scatter(results, x="SIMD_rank", y="NEAI", color="SIMD_decile", hover_name="DataZone",
-                             labels={"SIMD_rank": "SIMD rank (higher = less deprived)"})
-        st.plotly_chart(scatter, use_container_width=True)
-    with b:
-        box = px.box(results, x="SIMD_decile", y="NEAI", points=False,
-                     labels={"SIMD_decile": "SIMD deprivation decile"})
-        st.plotly_chart(box, use_container_width=True)
-    if results.NEAI.nunique() > 1 and results.SIMD_rank.nunique() > 1:
-        rho, p = spearmanr(results.SIMD_rank, results.NEAI)
-        st.metric("Spearman rank correlation", f"{rho:.3f}")
-        st.caption(f"Exploratory p-value: {p:.3g}. Correlation is not causation; spatial dependence affects inference.")
-    st.subheader("Most deprived areas with low modelled access")
-    priority = results[results.SIMD_decile <= 2].sort_values("NEAI")
-    st.dataframe(priority[["DataZone", "SIMD_decile", "Population", "sites_reachable", "NEAI"]].head(30),
-                 use_container_width=True, hide_index=True)
 
-with explorer_tab:
-    st.subheader("How assumptions change the index")
-    st.write("Use the left-hand controls to vary distance thresholds, minimum park size, classifications and index weighting.")
-    hist = px.histogram(results, x="NEAI", nbins=20, title="Distribution of accessibility scores")
-    st.plotly_chart(hist, use_container_width=True)
-    choice = st.selectbox("Inspect data zone", sorted(results.DataZone))
-    r = results[results.DataZone == choice].iloc[0]
+    st.subheader(
+        "Relationship between deprivation "
+        "and greenspace proximity"
+    )
+
+    left, right = st.columns(2)
+
+    with left:
+
+        fig_scatter = px.scatter(
+            results,
+            x="SIMD_rank",
+            y="NEAI",
+            color="SIMD_decile",
+            hover_name="DataZone",
+            title="Deprivation versus proximity baseline"
+        )
+
+        st.plotly_chart(
+            fig_scatter,
+            use_container_width=True
+        )
+
+    with right:
+
+        fig_box = px.box(
+            results,
+            x="SIMD_decile",
+            y="NEAI",
+            title="Proximity baseline by SIMD decile"
+        )
+
+        st.plotly_chart(
+            fig_box,
+            use_container_width=True
+        )
+
+    # Spearman's rank correlation.
+
+    if (
+        results.NEAI.nunique() > 1
+        and results.SIMD_rank.nunique() > 1
+    ):
+
+        rho, p = spearmanr(
+            results.SIMD_rank,
+            results.NEAI
+        )
+
+        st.metric(
+            "Spearman rank correlation",
+            f"{rho:.3f}"
+        )
+
+        st.caption(
+            f"Exploratory p = {p:.3g}; "
+            "spatial autocorrelation can affect "
+            "statistical significance."
+        )
+
+    st.subheader(
+        "Most deprived data zones with "
+        "lowest proximity scores"
+    )
+
+    priority_zones = results[
+        results.SIMD_decile <= 2
+    ].sort_values("NEAI")
+
+    st.dataframe(
+        priority_zones[
+            [
+                "DataZone",
+                "SIMD_decile",
+                "Population",
+                "sites_reachable",
+                "NEAI"
+            ]
+        ].head(30),
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+# ============================================================
+# TAB 3 — SCENARIO EXPLORER
+# ============================================================
+
+with scenario_tab:
+
+    st.subheader("Interactive scenario analysis")
+
+    st.write(
+        "Change the sidebar controls to examine "
+        "how different assumptions affect "
+        "greenspace accessibility scores."
+    )
+
+    fig_histogram = px.histogram(
+        results,
+        x="NEAI",
+        nbins=20,
+        title="Distribution of proximity-based NEAI"
+    )
+
+    st.plotly_chart(
+        fig_histogram,
+        use_container_width=True
+    )
+
+    zone = st.selectbox(
+        "Inspect data zone",
+        sorted(results.DataZone)
+    )
+
+    r = results.loc[
+        results.DataZone == zone
+    ].iloc[0]
+
     x, y, z = st.columns(3)
-    x.metric("Index", f"{r.NEAI:.3f}")
-    y.metric("Sites in range", int(r.sites_reachable))
-    z.metric("Nearest site", f"{r.nearest_m:.0f} m" if pd.notna(r.nearest_m) else "None within threshold")
+
+    x.metric(
+        "Baseline index",
+        f"{r.NEAI:.3f}"
+    )
+
+    y.metric(
+        "Sites within threshold",
+        int(r.sites_reachable)
+    )
+
+    z.metric(
+        "Nearest site (straight line)",
+        (
+            f"{r.nearest_m:.0f} m"
+            if pd.notna(r.nearest_m)
+            else "None"
+        )
+    )
+
+
+# ============================================================
+# TAB 4 — METHODS AND DOWNLOADS
+# ============================================================
 
 with methodology_tab:
-    st.markdown("""
-**Data:** OS Open Greenspace sites and access points (2026 extract), SIMD 2020v2 ranks and populations,
-2011 Scottish data-zone boundaries. All data are real, but straight-line access is only a baseline.
 
-**Proximity:** `max(0, 1 − nearest qualifying site distance / threshold)`.
+    st.subheader("Data and methodology")
 
-**Provision:** `min(1, distinct qualifying reachable sites / 5)`.
+    st.markdown(
+        """
+### Data sources
 
-**Index:** `NEAI = weight × proximity + (1 − weight) × provision`.
+The application combines:
 
-**Important limitations:** The 2011-zone centroid/representative point is not a population-weighted dwelling location.
-OS Open Greenspace categories do not verify public accessibility or ecological quality. Baseline distances
-measure straight-line proximity to mapped access points; they do **not** account for barriers, street layout
-or pedestrian restrictions. OS Open Roads alone is not a complete pedestrian network. SIMD 2020v2 is a
-historical, relative deprivation measure. This project does not establish causal relationships.
+- OS Open Greenspace sites and access points.
+- Scottish Index of Multiple Deprivation 2020v2.
+- Scottish Data Zone Boundaries 2011.
 
-**Next methodological stage:** Independently preprocess and validate a pedestrian-accessible road/path network,
-then add `data/network_distances.csv` containing one record per data-zone/site pair with the shortest
-verified network distance in metres (covering at least the full 2 km scenario threshold). An absent route
-must be distinguished from a route not computed. Until then the application remains a proximity baseline.
-""")
-    st.download_button("Download scenario results (CSV)", results.to_csv(index=False).encode("utf-8"),
-                       file_name="neai_edinburgh_results.csv", mime="text/csv")
-    st.caption("Contains Ordnance Survey data © Crown copyright and database right 2026. "
-               "Scottish Government data-zone and SIMD data under the Open Government Licence.")
+### Distance calculation
 
-st.caption("NEAI · Research prototype · Independent analysis, with AI-assisted development")
+The shortest straight-line distance is measured
+between each data-zone reference point and
+mapped greenspace access points.
+
+The Haversine formula calculates geographical
+distance using latitude and longitude.
+
+Multiple entrances belonging to the same
+greenspace count as one site.
+
+### Proximity score
+
+P = max(0, 1 - nearest distance / threshold)
+
+If no qualifying greenspace lies within
+the threshold, the proximity score is zero.
+
+### Provision score
+
+G = min(1, reachable greenspaces / 5)
+
+Five or more qualifying greenspaces receive
+the maximum provision score.
+
+### Nature Equitable Access Index
+
+NEAI = weight × proximity + (1 - weight) × provision
+
+Scores range from zero to one.
+
+### Limitations
+
+This version does not model pedestrian routes.
+
+Straight-line distances ignore:
+
+- Road layout.
+- Railway lines and other barriers.
+- Footpaths and pedestrian crossings.
+- Site-specific access restrictions.
+- Differences in greenspace quality.
+
+Data-zone reference points do not represent
+every individual residential location.
+
+SIMD 2020v2 is a historical dataset.
+
+Statistical correlation does not establish causation.
+
+### Future development
+
+Replace the straight-line distance matrix with
+validated network distances derived from OS Open
+Roads or an appropriate pedestrian network.
+"""
+    )
+
+    st.subheader("Download NEAI results")
+
+    csv = results.to_csv(
+        index=False
+    ).encode("utf-8")
+
+    st.download_button(
+        label="Download scenario results (CSV)",
+        data=csv,
+        file_name="neai_edinburgh_results.csv",
+        mime="text/csv"
+    )
+
+    st.caption(
+        "Contains Ordnance Survey data "
+        "© Crown copyright and database right 2026. "
+        "Scottish Government data under the "
+        "Open Government Licence."
+    )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.divider()
+
+st.caption(
+    "Edinburgh Nature Equitable Access Index | "
+    "Research prototype | AI-assisted development"
+)
